@@ -6,12 +6,13 @@ import signal
 import fcntl
 import termios
 import struct
+import select
 
 COLS = 50
 ROWS = 25
 MAX_FRAMES = 300
 
-os.makedirs("../data", exist_ok=True)
+os.makedirs("../dataset/raw", exist_ok=True)
 
 for tree in range(1000):
     screen = pyte.Screen(COLS, ROWS)
@@ -33,6 +34,11 @@ for tree in range(1000):
     previous = None
 
     while True:
+        ready, _, _ = select.select([fd], [], [], 1.0)
+
+        if not ready:
+            break
+
         try:
             data = os.read(fd, 4096)
         except OSError:
@@ -42,10 +48,10 @@ for tree in range(1000):
             break
 
         stream.feed(data.decode("utf-8", errors="ignore"))
-        current = "\n".join(screen.display)
+        current = "\n".join(screen.display[:-4])
 
         if current != previous:
-            folder = Path(f"../data/tree_{tree:04d}")
+            folder = Path(f"../dataset/raw/tree_{tree:04d}")
             folder.mkdir(parents=True, exist_ok=True)
 
             with open(folder / f"frame_{frame:04d}.txt", "w") as f:
