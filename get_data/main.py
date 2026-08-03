@@ -8,8 +8,8 @@ import termios
 import struct
 import select
 
-COLS = 50
-ROWS = 25
+COLS = 48
+ROWS = 28
 MAX_FRAMES = 300
 
 os.makedirs("../dataset/raw", exist_ok=True)
