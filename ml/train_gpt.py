@@ -176,44 +176,104 @@ import torch
 
 import numpy as np
 import torch
+import numpy as np
+import torch
+import os
+import glob
+import re
+from typing import List, Optional
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, token_file="tokens.bin", 
-                 split='train', val_frac=0.05):
+    def __init__(
+        self,
+        B: int,
+        T: int,
+        process_rank: int,
+        num_processes: int,
+        split: str = 'train',
+        data_root: str = "dataset/tokenized",
+        val_frac: float = 0.05
+    ):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.split = split
-        
-        # open in memory mapped mode
-        self.tokens = np.memmap(token_file, dtype=np.uint32, mode='r')
-        total_tokens = len(self.tokens)
-        
-        split_idx = int(total_tokens * (1 - val_frac))
+
+        tree_pattern = os.path.join(data_root, "tree_*")
+        tree_dirs = glob.glob(tree_pattern)
+        if not tree_dirs:
+            raise ValueError(f"No tree directories found under {data_root}")
+
+        def tree_id(path: str) -> int:
+            match = re.search(r'tree_(\d+)$', path)
+            if not match:
+                raise ValueError(f"Invalid tree directory name: {path}")
+            return int(match.group(1))
+
+        tree_dirs = sorted(tree_dirs, key=tree_id)
+
+        split_idx = int(len(tree_dirs) * (1 - val_frac))
         if split == 'train':
-            self.tokens = self.tokens[:split_idx]
+            tree_dirs = tree_dirs[:split_idx]
         else:
-            self.tokens = self.tokens[split_idx:]
-            
+            tree_dirs = tree_dirs[split_idx:]
+
+        if not tree_dirs:
+            raise ValueError(f"No tree directories for split '{split}'")
+
+        all_tokens = []
+        for tree_dir in tree_dirs:
+            frame_pattern = os.path.join(tree_dir, "frame_*.txt")
+            frame_files = glob.glob(frame_pattern)
+            if not frame_files:
+                print(f"Warning: no frame files found in {tree_dir}")
+                continue
+
+            def frame_id(path: str) -> int:
+                match = re.search(r'frame_(\d+)\.txt$', path)
+                if not match:
+                    raise ValueError(f"Invalid frame file name: {path}")
+                return int(match.group(1))
+
+            frame_files = sorted(frame_files, key=frame_id)
+
+            for fname in frame_files:
+                with open(fname, 'r') as f:
+                    content = f.read().strip()
+                digits = re.sub(r'\s+', '', content)
+                tokens = [int(ch) for ch in digits if ch.isdigit()]
+                if len(tokens) != 24 * 48:
+                    print(f"Warning: {fname} has {len(tokens)} tokens, expected 1152")
+                all_tokens.extend(tokens)
+
+        if not all_tokens:
+            raise ValueError(f"No tokens loaded for split '{split}'")
+
+        self.tokens = np.array(all_tokens, dtype=np.uint32)
         self.num_tokens = len(self.tokens)
+
         print(f"Loaded {self.num_tokens} tokens for {split} split")
-        print(f"1 epoch = {self.num_tokens // (B*T)} batches")
-        
+        print(f"1 epoch = {self.num_tokens // (B * T)} batches")
+
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
         pos = self.current_position
-        buf = torch.from_numpy(self.tokens[pos : pos + B*T + 1]).to(torch.long)
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B, T)
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B*T*self.num_processes + 1) > self.num_tokens:
+
+        if pos + B * T + 1 > self.num_tokens:
             if self.split == 'train':
                 self.current_position = self.B * self.T * self.process_rank
             else:
                 self.current_position = self.B * self.T * self.process_rank
+            pos = self.current_position
+
+        buf = torch.from_numpy(self.tokens[pos : pos + B * T + 1]).to(torch.long)
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
+        self.current_position += B * T * self.num_processes
         return x, y
     
 # --------------------------------------
@@ -305,7 +365,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 100
-max_steps = 20000
+max_steps = 1
 
 def get_lr(it):
     if it < warmup_steps:
@@ -373,8 +433,8 @@ if ddp:
 
 #import sys; sys.exit(0)
 
-num_return_sequences = 5
-max_length = 30
+num_return_sequences = 1
+max_length = 24*48
 
 # prefix tokens
 enc = tiktoken.get_encoding('gpt2')
