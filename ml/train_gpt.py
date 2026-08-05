@@ -29,6 +29,7 @@ class CausalSelfAttention(nn.Module):
                             # then we want to broadcast it to (batch_size, n_head)
         
     def forward(self, x):
+        #print(f"x.shape: {x.shape}")
         # (batch_size, token_len, n_emb)
         B, T, C = x.size()
         # k,q,v are not learned, they are only acivations computed for every input
@@ -88,30 +89,61 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 12
-    n_emb: int = 768
+    block_size: int = 256        # number of frames in context
+    vocab_size: int = 1          # unused, but keeping for compatibility
+    n_layer: int = 4
+    n_head: int = 4
+    n_emb: int = 64
+    frame_dim: int = 24 * 48     # 1152
 
+
+import torch.nn as nn
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_emb),                # token embeddings
-            wpe = nn.Embedding(config.block_size, config.n_emb),                # positional encodings
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # all the blocks in the transformer
-            ln_f = nn.LayerNorm(config.n_emb),                                  # linear layer at the end
-        ))
-        self.lm_head = nn.Linear(config.n_emb, config.vocab_size, bias=False)
+        # frame encoder: raw pixels (1152) -> embedding (n_emb)
+        # linear for now
+        self.frame_encoder = nn.Linear(config.frame_dim, config.n_emb, bias=False)
 
-        # weight sharing scheme
-        self.transformer.wte.weight = self.lm_head.weight
+        # positional embeddings
+        self.pos_embedding = nn.Embedding(config.block_size, config.n_emb)
 
+        # transformer blocks
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+
+        # final layer norm and decoder
+        self.ln_f = nn.LayerNorm(config.n_emb)
+        self.frame_decoder = nn.Linear(config.n_emb, config.frame_dim, bias=False)
+
+        # weight initialization
+        self.apply(self._init_weights)
+
+    def forward(self, x, targets=None):
+        # x: (B, T, 1152)
+        B, T, _ = x.shape
+        
+        # encode each frame to embedding space
+        x = self.frame_encoder(x)  # (B, T, n_emb)
+        
+        # add positional embeddings
+        pos = torch.arange(0, T, device=x.device).unsqueeze(0)  # (1, T)
+        x = x + self.pos_embedding(pos)  # (B, T, n_emb)
+        
+        # pass through transformer blocks
+        for block in self.blocks:
+            x = block(x)  # (B, T, n_emb)
+        
+        x = self.ln_f(x)
+        logits = self.frame_decoder(x)  # (B, T, 1152)
+        
+        if targets is not None:
+            loss = nn.functional.mse_loss(logits, targets)
+            return logits, loss
+        return logits, None
+    
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
@@ -122,31 +154,9 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-        # forward token and position embeddings
-        # [0, 1, 2, ..., T-1] of shape (T,)
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)   # shape (T)
-        pos_emb = self.transformer.wpe(pos) # (T,) -> (T, n_emb)
-        tok_emb = self.transformer.wte(idx) # (B, T) -> (B, T, n_emb)
-        x = tok_emb + pos_emb               # (B, T, n_emb)
-        # forward the blocks of the transformer
-        for block in self.transformer.h:
-            x = block(x)
-        # forward the layernorm and the classifier
-        x = self.transformer.ln_f(x)        # (B, T, n_emb)
-        logits = self.lm_head(x)            # (B, T, vocab_size)
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
     
     def configure_optimizers(self, weight_decay, learning_rate, device):
-        # all parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # parameters which require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
         # overfitting happens because of multiplication, not addition
@@ -182,18 +192,15 @@ import os
 import glob
 import re
 from typing import List, Optional
+import numpy as np
+import torch
+import os
+import glob
+import re
 
 class DataLoaderLite:
-    def __init__(
-        self,
-        B: int,
-        T: int,
-        process_rank: int,
-        num_processes: int,
-        split: str = 'train',
-        data_root: str = "dataset/tokenized",
-        val_frac: float = 0.05
-    ):
+    def __init__(self, B, T, process_rank, num_processes, split='train',
+                 data_root="../dataset/tokenized", val_frac=0.05):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -207,10 +214,7 @@ class DataLoaderLite:
 
         def tree_id(path: str) -> int:
             match = re.search(r'tree_(\d+)$', path)
-            if not match:
-                raise ValueError(f"Invalid tree directory name: {path}")
-            return int(match.group(1))
-
+            return int(match.group(1)) if match else 0
         tree_dirs = sorted(tree_dirs, key=tree_id)
 
         split_idx = int(len(tree_dirs) * (1 - val_frac))
@@ -218,64 +222,71 @@ class DataLoaderLite:
             tree_dirs = tree_dirs[:split_idx]
         else:
             tree_dirs = tree_dirs[split_idx:]
-
         if not tree_dirs:
             raise ValueError(f"No tree directories for split '{split}'")
 
-        all_tokens = []
+        all_frames = []
         for tree_dir in tree_dirs:
-            frame_pattern = os.path.join(tree_dir, "frame_*.txt")
-            frame_files = glob.glob(frame_pattern)
+            frame_files = glob.glob(os.path.join(tree_dir, "frame_*.txt"))
             if not frame_files:
-                print(f"Warning: no frame files found in {tree_dir}")
                 continue
-
             def frame_id(path: str) -> int:
                 match = re.search(r'frame_(\d+)\.txt$', path)
-                if not match:
-                    raise ValueError(f"Invalid frame file name: {path}")
-                return int(match.group(1))
-
+                return int(match.group(1)) if match else 0
             frame_files = sorted(frame_files, key=frame_id)
 
             for fname in frame_files:
                 with open(fname, 'r') as f:
                     content = f.read().strip()
                 digits = re.sub(r'\s+', '', content)
-                tokens = [int(ch) for ch in digits if ch.isdigit()]
-                if len(tokens) != 24 * 48:
-                    print(f"Warning: {fname} has {len(tokens)} tokens, expected 1152")
-                all_tokens.extend(tokens)
+                vec = np.array([int(c) for c in digits if c.isdigit()], dtype=np.float32)
+                if len(vec) != 24*48:
+                    if len(vec) < 24*48:
+                        vec = np.pad(vec, (0, 24*48 - len(vec)))
+                    else:
+                        vec = vec[:24*48]
+                vec = vec / 9.0   # normalization
+                all_frames.append(vec)
 
-        if not all_tokens:
-            raise ValueError(f"No tokens loaded for split '{split}'")
+        if not all_frames:
+            raise ValueError(f"No frames loaded for split '{split}'")
 
-        self.tokens = np.array(all_tokens, dtype=np.uint32)
-        self.num_tokens = len(self.tokens)
+        self.frames = np.stack(all_frames, axis=0)   # (N, 1152)
+        self.num_frames = self.frames.shape[0]
 
-        print(f"Loaded {self.num_tokens} tokens for {split} split")
-        print(f"1 epoch = {self.num_tokens // (B * T)} batches")
+        if self.num_frames < B * T + 1:
+            raise ValueError(
+                f"Dataset has only {self.num_frames} frames, "
+                f"but batch needs {B*T+1} frames (B={B}, T={T}). Reduce B or T."
+            )
 
-        self.current_position = self.B * self.T * self.process_rank
+        print(f"Loaded {self.num_frames} frames for {split} split")
+        print(f"1 epoch = {self.num_frames // (B * T)} batches")
+
+        self.current_position = (self.B * self.T * self.process_rank) % self.num_frames
 
     def next_batch(self):
         B, T = self.B, self.T
         pos = self.current_position
 
-        if pos + B * T + 1 > self.num_tokens:
-            if self.split == 'train':
-                self.current_position = self.B * self.T * self.process_rank
-            else:
-                self.current_position = self.B * self.T * self.process_rank
-            pos = self.current_position
+        # wrapping
+        if pos + B * T + 1 > self.num_frames:
+            pos = (self.B * self.T * self.process_rank) % self.num_frames
+            self.current_position = pos
 
-        buf = torch.from_numpy(self.tokens[pos : pos + B * T + 1]).to(torch.long)
-        x = buf[:-1].view(B, T)
-        y = buf[1:].view(B, T)
+        # Buffer of (B*T+1) frames
+        buf = self.frames[pos : pos + B * T + 1]   # (B*T+1, 1152)
+        assert buf.shape[0] == B * T + 1, f"Expected {B*T+1}, got {buf.shape[0]}"
+
+        x = torch.from_numpy(buf[:-1]).float().view(B, T, -1)
+        y = torch.from_numpy(buf[1:]).float().view(B, T, -1)
 
         self.current_position += B * T * self.num_processes
+        if self.current_position >= self.num_frames:
+            self.current_position = (self.B * self.T * self.process_rank) % self.num_frames
+
         return x, y
-    
+
 # --------------------------------------
 
 from torch.distributed import init_process_group, destroy_process_group
@@ -332,11 +343,11 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-# gradient accumulation
-total_batch_size = 131072
-B = 16      # micro batch size
-T = 1024    # sequence length
+B = 8    # micro batch size
+T = 4    # sequence length
+total_batch_size = B * T * 1
 assert total_batch_size % (B * T * ddp_world_size) == 0, "total_batch_size shoudl be divisibel by B * T * ddp_world_size"
+# gradient accumulation
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
@@ -355,7 +366,7 @@ torch.set_float32_matmul_precision('medium')
 config = GPTConfig()
 model = GPT(config)
 model.to(device)
-model = torch.compile(model)
+#model = torch.compile(model)
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -365,8 +376,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 100
-max_steps = 1
-
+max_steps = 1000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -390,7 +400,7 @@ for step in range(max_steps):
         x, y = x.to(device), y.to(device)
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
-        loss = loss / grad_accum_steps      # loss must me mean
+        loss = loss / grad_accum_steps      # loss must be mean
         loss_accum += loss.detach()
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
@@ -408,7 +418,7 @@ for step in range(max_steps):
     dt = (t1 - t0)
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
-    if master_process and step % 50 == 0:
+    if master_process and step % 200 == 0:
         print(
             f"step {step}, loss: {loss_accum.item():.6f}, "
             f"[{datetime.now().strftime('%H:%M:%S')}] "
@@ -416,7 +426,7 @@ for step in range(max_steps):
             f"dt: {dt:.2f}s, tok/sec: {tokens_per_sec:.2f}"
         )
 
-    if step % 100 == 0 and master_process:
+    if step % 1000 == 0 and master_process:
         val_loss = evaluate_loss(raw_model, val_loader, grad_accum_steps, device, ddp)
         print(f"\nstep {step} | validation loss: {val_loss:.6f}\n")
 
@@ -432,39 +442,3 @@ if ddp:
 
 
 #import sys; sys.exit(0)
-
-num_return_sequences = 1
-max_length = 24*48
-
-# prefix tokens
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("TITLE:")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)    # (5, 8) 5 samples
-x = tokens.to('cuda')
-
-# generating
-# x is (B, T) where B=5, T=8
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get logits
-    with torch.no_grad():
-        logits, loss = raw_model(x)           # (B, T, vocab_size)
-        # predictions for the last token, inefective but okay here
-        logits = logits[:, -1, :]   # (B, T, vocab_size) -> (B, vocab_size)
-        probs = F.softmax(logits, dim=-1)
-        # top-k sampling of 50 (huggingface pipeline default) for every element in the batch
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # both(5, 50)
-        # select a token from the top-k probabilities, returns an index
-        ix = torch.multinomial(topk_probs, 1)
-        # gather the corresponding indices (gets the elements of a given index)
-        xcol = torch.gather(topk_indices, -1, ix)   # (B, 1)
-        # append to the sequence (x += xcol)
-        x = torch.cat((x, xcol), dim=1)
-
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
