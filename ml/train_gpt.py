@@ -181,7 +181,6 @@ class GPT(nn.Module):
         return optimizer
 
 
-import tiktoken
 import torch
 
 import numpy as np
@@ -435,10 +434,118 @@ if master_process:
     torch.save({
     'model_state_dict': raw_model.state_dict(),
     'config': config
-}, "bonsai_model.pt")
+}, "bonsai_model2.pt")
 
 if ddp:
     destroy_process_group()
 
 
 #import sys; sys.exit(0)
+
+import os
+import glob
+import re
+import numpy as np
+import torch
+
+tree_dir = "../dataset/tokenized/tree_0001"
+T_start = 4
+num_frames_to_generate = 200
+
+frame_pattern = os.path.join(tree_dir, "frame_*.txt")
+frame_files = glob.glob(frame_pattern)
+
+def frame_id(path: str) -> int:
+    match = re.search(r'frame_(\d+)\.txt$', path)
+    return int(match.group(1)) if match else 0
+
+frame_files = sorted(frame_files, key=frame_id)
+print(len(frame_files))
+
+initial_frames = []
+for i in range(T_start):
+    fname = frame_files[i]
+    with open(fname, 'r') as f:
+        content = f.read().strip()
+    digits = re.sub(r'\s+', '', content)
+    vec = np.array([int(c) for c in digits if c.isdigit()], dtype=np.float32)
+    if len(vec) != 1152:
+        if len(vec) < 1152:
+            vec = np.pad(vec, (0, 1152 - len(vec)))
+        else:
+            vec = vec[:1152]
+    vec = vec / 9.0         # normalization
+    initial_frames.append(vec)
+
+context = np.stack(initial_frames, axis=0)  # (T_start, 1152)
+context = torch.from_numpy(context).float().unsqueeze(0)  # (1, T_start, 1152)
+context = context.to('cuda')
+
+print(f"Context shape: {context.shape}")  # torch.Size([1, 4, 1152])
+
+model.eval()
+generated = context
+
+max_len = config.block_size
+if context.shape[1] > max_len:
+    raise ValueError(f"Context length {context.shape[1]} > block_size {max_len}")
+
+with torch.no_grad():
+    for step in range(num_frames_to_generate):
+        if generated.shape[1] >= max_len:
+            print(f"Reach maximum length {max_len}, stopping.")
+            break
+        
+        logits, _ = model(generated)
+        next_frame = logits[:, -1:, :]
+        generated = torch.cat([generated, next_frame], dim=1)
+        print(f"Step {step+1}/{num_frames_to_generate}, seq length: {generated.shape[1]}")
+
+
+output_dir = "generated_frames2"
+os.makedirs(output_dir, exist_ok=True)
+
+mapping = {
+    0: ' ',
+    1: '/',
+    2: '|',
+    3: '\\',
+    4: '_',
+    5: '~',
+    6: '&',
+}
+
+num_frames = generated.shape[1]
+
+for i in range(num_frames):
+    frame_vec = generated[0, i, :].cpu().numpy()            # (1152,)
+    frame_vec = frame_vec * 9.0                             # denormalize
+    frame_vec = np.round(frame_vec).clip(0, 6).astype(int)  # (1152,)
+    
+    grid = frame_vec.reshape(24, 48)  # (24, 48)
+    
+    def map_value(x):
+        return mapping.get(x, str(x))
+    
+    """lines = []
+    for row in range(24):
+        line = ' '.join(map(str, grid[row]))
+        lines.append(line)
+
+    content = '\n'.join(lines)"""
+
+    lines = []
+    for row in range(24):
+        line_chars = [map_value(grid[row, col]) for col in range(48)]
+        lines.append(''.join(line_chars))
+
+    content = '\n'.join(lines)
+    
+    filename = os.path.join(output_dir, f"frame_{i:04d}.txt")
+    with open(filename, 'w') as f:
+        f.write(content)
+    
+    if (i + 1) % 50 == 0:
+        print(f"Saved {i+1}/{num_frames} frame")
+
+print(f"✅ Saved all {num_frames} frames in directory: {output_dir}")
