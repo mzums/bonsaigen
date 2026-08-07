@@ -12,6 +12,12 @@ from datetime import datetime
 
 # ---------------------------------------------
 
+
+def focal_loss(logits, targets, gamma=2.0, alpha=None):
+    ce_loss = F.cross_entropy(logits, targets, reduction='none', weight=alpha)
+    pt = torch.exp(-ce_loss)
+    return ((1 - pt) ** gamma * ce_loss).mean()
+
 class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
@@ -90,7 +96,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 256        # number of frames in context
-    vocab_size: int = 1          # unused, but keeping for compatibility
+    vocab_size: int = 7
     n_layer: int = 4
     n_head: int = 4
     n_emb: int = 64
@@ -103,46 +109,40 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-
-        # frame encoder: raw pixels (1152) -> embedding (n_emb)
-        # linear for now
         self.frame_encoder = nn.Linear(config.frame_dim, config.n_emb, bias=False)
-
-        # positional embeddings
         self.pos_embedding = nn.Embedding(config.block_size, config.n_emb)
-
-        # transformer blocks
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-
-        # final layer norm and decoder
         self.ln_f = nn.LayerNorm(config.n_emb)
-        self.frame_decoder = nn.Linear(config.n_emb, config.frame_dim, bias=False)
-
-        # weight initialization
+        self.register_buffer('class_weights', torch.ones(config.vocab_size))
+        
+        self.frame_decoder = nn.Linear(config.n_emb, config.frame_dim * config.vocab_size, bias=False)
         self.apply(self._init_weights)
 
     def forward(self, x, targets=None):
-        # x: (B, T, 1152)
         B, T, _ = x.shape
+        x = self.frame_encoder(x)
+        pos = torch.arange(0, T, device=x.device).unsqueeze(0)
+        x = x + self.pos_embedding(pos)
         
-        # encode each frame to embedding space
-        x = self.frame_encoder(x)  # (B, T, n_emb)
-        
-        # add positional embeddings
-        pos = torch.arange(0, T, device=x.device).unsqueeze(0)  # (1, T)
-        x = x + self.pos_embedding(pos)  # (B, T, n_emb)
-        
-        # pass through transformer blocks
         for block in self.blocks:
-            x = block(x)  # (B, T, n_emb)
-        
+            x = block(x)
         x = self.ln_f(x)
-        logits = self.frame_decoder(x)  # (B, T, 1152)
+        
+        # Reshape logits to (B, T, 1152, 7)
+        logits = self.frame_decoder(x)  # (B, T, 1152*7)
+        logits = logits.view(B, T, self.config.frame_dim, self.config.vocab_size)
         
         if targets is not None:
-            loss = nn.functional.mse_loss(logits, targets)
+            # targets must be (B, T, 1152) with integer class indices 0-6
+            loss = focal_loss(logits.view(-1, self.config.vocab_size), targets.view(-1), gamma=2.0, alpha=self.class_weights)
             return logits, loss
         return logits, None
+
+    def focal_loss(logits, targets, gamma=2.0, alpha=None):
+        ce_loss = F.cross_entropy(logits, targets, reduction='none', weight=alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** gamma * ce_loss
+        return focal_loss.mean()
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -244,8 +244,7 @@ class DataLoaderLite:
                         vec = np.pad(vec, (0, 24*48 - len(vec)))
                     else:
                         vec = vec[:24*48]
-                vec = vec / 9.0   # normalization
-                all_frames.append(vec)
+                all_frames.append(vec.astype(np.float32))
 
         if not all_frames:
             raise ValueError(f"No frames loaded for split '{split}'")
@@ -261,6 +260,10 @@ class DataLoaderLite:
 
         print(f"Loaded {self.num_frames} frames for {split} split")
         print(f"1 epoch = {self.num_frames // (B * T)} batches")
+
+        self.class_counts = np.bincount(self.frames.flatten().astype(int), minlength=7)
+        self.class_weights = torch.tensor(1.0 / (self.class_counts + 1e-8), dtype=torch.float)
+        self.class_weights = self.class_weights / self.class_weights.mean()
 
         self.current_position = (self.B * self.T * self.process_rank) % self.num_frames
 
@@ -278,7 +281,7 @@ class DataLoaderLite:
         assert buf.shape[0] == B * T + 1, f"Expected {B*T+1}, got {buf.shape[0]}"
 
         x = torch.from_numpy(buf[:-1]).float().view(B, T, -1)
-        y = torch.from_numpy(buf[1:]).float().view(B, T, -1)
+        y = torch.from_numpy(buf[1:]).long().view(B, T, -1)
 
         self.current_position += B * T * self.num_processes
         if self.current_position >= self.num_frames:
@@ -365,6 +368,7 @@ torch.set_float32_matmul_precision('medium')
 config = GPTConfig()
 model = GPT(config)
 model.to(device)
+model.class_weights = train_loader.class_weights.to(device)
 #model = torch.compile(model)
 
 if ddp:
@@ -375,7 +379,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 100
-max_steps = 1000
+max_steps = 10000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -448,7 +452,7 @@ import re
 import numpy as np
 import torch
 
-tree_dir = "../dataset/tokenized/tree_0001"
+tree_dir = "../dataset/tokenized/tree_0002"
 T_start = 4
 num_frames_to_generate = 200
 
@@ -474,7 +478,6 @@ for i in range(T_start):
             vec = np.pad(vec, (0, 1152 - len(vec)))
         else:
             vec = vec[:1152]
-    vec = vec / 9.0         # normalization
     initial_frames.append(vec)
 
 context = np.stack(initial_frames, axis=0)  # (T_start, 1152)
@@ -497,7 +500,10 @@ with torch.no_grad():
             break
         
         logits, _ = model(generated)
-        next_frame = logits[:, -1:, :]
+        next_frame_logits = logits[:, -1, :, :]          # (1, 1152, 7)
+        next_frame_indices = next_frame_logits.argmax(dim=-1)  # (1, 1152)  wartości 0-6
+        
+        next_frame = next_frame_indices.float().unsqueeze(1)
         generated = torch.cat([generated, next_frame], dim=1)
         print(f"Step {step+1}/{num_frames_to_generate}, seq length: {generated.shape[1]}")
 
@@ -518,9 +524,8 @@ mapping = {
 num_frames = generated.shape[1]
 
 for i in range(num_frames):
-    frame_vec = generated[0, i, :].cpu().numpy()            # (1152,)
-    frame_vec = frame_vec * 9.0                             # denormalize
-    frame_vec = np.round(frame_vec).clip(0, 6).astype(int)  # (1152,)
+    frame_vec = generated[0, i, :].cpu().numpy()            # (1152,)                             # denormalize
+    frame_vec = frame_vec.astype(int)
     
     grid = frame_vec.reshape(24, 48)  # (24, 48)
     
