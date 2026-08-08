@@ -376,10 +376,10 @@ if ddp:
 raw_model = model.module if ddp else model
 
 # cosine learning rate decay
-max_lr = 6e-4
+max_lr = 1e-3
 min_lr = max_lr * 0.1
-warmup_steps = 100
-max_steps = 10000
+warmup_steps = 1000
+max_steps = 100000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -496,15 +496,25 @@ if context.shape[1] > max_len:
 with torch.no_grad():
     for step in range(num_frames_to_generate):
         if generated.shape[1] >= max_len:
-            print(f"Reach maximum length {max_len}, stopping.")
             break
         
-        logits, _ = model(generated)
-        next_frame_logits = logits[:, -1, :, :]          # (1, 1152, 7)
-        next_frame_indices = next_frame_logits.argmax(dim=-1)  # (1, 1152)  wartości 0-6
+        logits, _ = model(generated)   # (1, T, 1152, 7)
+        
+        temperature = 0.3
+        top_k = 5
+        
+        next_logits = logits[:, -1, :, :] / temperature   # (1, 1152, 7)
+        
+        top_k_logits, top_k_indices = torch.topk(next_logits, top_k, dim=-1)
+        new_logits = torch.full_like(next_logits, float('-inf'))
+        new_logits.scatter_(-1, top_k_indices, top_k_logits)
+        
+        probs = torch.softmax(new_logits, dim=-1)   # (1, 1152, 7)
+        next_frame_indices = torch.multinomial(probs.view(-1, 7), num_samples=1).view(1, 1152)
         
         next_frame = next_frame_indices.float().unsqueeze(1)
         generated = torch.cat([generated, next_frame], dim=1)
+        
         print(f"Step {step+1}/{num_frames_to_generate}, seq length: {generated.shape[1]}")
 
 
