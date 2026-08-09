@@ -1,0 +1,379 @@
+from dataclasses import dataclass
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import math
+import numpy as np
+import json
+import time
+import inspect
+import os
+from datetime import datetime
+
+# ---------------------------------------------
+
+
+class ConvEncoder(nn.Module):
+    def __init__(self, n_emb):
+        super().__init__()
+
+        self.conv1 = torch.nn.Conv2d(1, 16, 3, padding='same')
+        self.conv2 = torch.nn.Conv2d(16, 32, 3, padding='same')
+        self.conv3 = torch.nn.Conv2d(32, 64, 3, padding='same')
+
+        self.bn1 = torch.nn.BatchNorm2d(16)
+        self.bn2 = torch.nn.BatchNorm2d(32)
+        self.bn3 = torch.nn.BatchNorm2d(64)
+
+        self.maxpool = torch.nn.MaxPool2d(2, 2)
+        self.global_avg_pool = torch.nn.AdaptiveAvgPool2d(1)
+        self.linear = torch.nn.Linear(64, n_emb)
+
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        x = self.global_avg_pool(x)
+        x = x.flatten(1)
+        x = self.linear(x)
+        return x
+
+
+class ConvDecoder(nn.Module):
+    def __init__(self, n_emb):
+        super().__init__()
+
+        self.linear = torch.nn.Linear(n_emb, 64*6*12)
+        self.up = torch.nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv1 = torch.nn.Conv2d(64, 32, 3, padding='same')
+        self.conv2 = torch.nn.Conv2d(32, 16, 3, padding='same')
+        self.conv3 = torch.nn.Conv2d(16, 7, 3, padding='same')
+
+        self.bn1 = torch.nn.BatchNorm2d(32)
+        self.bn2 = torch.nn.BatchNorm2d(16)
+
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = x.reshape(-1, 64, 6, 12)
+        x = self.up(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.up(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv3(x)
+        return x
+
+class CausalSelfAttention(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_emb % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_emb, 3*config.n_emb)
+        self.c_proj = nn.Linear(config.n_emb, config.n_emb)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.n_head = config.n_head
+        self.n_emb = config.n_emb
+        # buffer because it should be constant, it's not a parameter
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
+                            # (1,1) is because later we use self.bias[:,:,:T,:T]
+                            # then we want to broadcast it to (batch_size, n_head)
+        
+    def forward(self, x):
+        #print(f"x.shape: {x.shape}")
+        # (batch_size, token_len, n_emb)
+        B, T, C = x.size()
+        # k,q,v are not learned, they are only acivations computed for every input
+        # the model learns only weights in c_attn and weights in c_proj
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_emb, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # # for every query all the keys should sum to 1
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # to revert .transpose(1, 2) ^
+        # transpose doesn't physically revert data, only changes metadata and shape but view requires contiguous data so we must physically revert the data
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
+
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc   = nn.Linear(config.n_emb, 4*config.n_emb)
+        # historical, it was like this in GPT2, so I use it
+        self.gelu   = nn.GELU(approximate='tanh')
+        self.c_proj = nn.Linear(4*config.n_emb, config.n_emb)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        # norm before attention (unlike in the original transformer paper)
+        self.ln_1 = nn.LayerNorm(config.n_emb)  # layer norm
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_emb)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))     # residual connection
+        x = x + self.mlp(self.ln_2(x))      # residual connection
+        return x
+
+@dataclass
+class GPTConfig:
+    block_size: int = 256        # number of frames in context
+    vocab_size: int = 7
+    n_layer: int = 8
+    n_head: int = 8
+    n_emb: int = 128
+    #frame_dim: int = 24 * 48     # 1152
+
+
+import torch.nn as nn
+
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.frame_encoder = ConvEncoder(config.n_emb)
+        self.pos_embedding = nn.Embedding(config.block_size, config.n_emb)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_emb)
+        self.register_buffer('class_weights', torch.ones(config.vocab_size))
+        
+        self.frame_decoder = ConvDecoder(config.n_emb)
+        self.apply(self._init_weights)
+
+    def forward(self, x, targets=None):
+        B, T, _ = x.shape
+        
+        # Enkoder
+        x = x.view(B * T, 1, 24, 48)
+        x = self.frame_encoder(x)          # (B*T, n_emb)
+        x = x.view(B, T, -1)               # (B, T, n_emb)
+        
+        # Positional embeddings
+        pos = torch.arange(0, T, device=x.device).unsqueeze(0)
+        x = x + self.pos_embedding(pos)
+        
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)                   # (B, T, n_emb)
+        
+        # Dekoder
+        x = x.view(B * T, -1)              # (B*T, n_emb)
+        logits = self.frame_decoder(x)     # (B*T, 7, 24, 48)
+        
+        # Przekształcenie na (B, T, 1152, 7)
+        logits = logits.view(B, T, 7, 24, 48)
+        logits = logits.permute(0, 1, 3, 4, 2)  # (B, T, 24, 48, 7)
+        logits = logits.contiguous().view(B, T, -1, self.config.vocab_size)  # (B, T, 1152, 7)
+        
+        if targets is not None:
+            logits = logits / 2.0
+            main_loss = self.focal_loss(
+                logits.view(-1, self.config.vocab_size),
+                targets.view(-1),
+                gamma=0.8,
+                alpha=self.class_weights
+            )
+            logits_flat = logits.view(B, T, -1, self.config.vocab_size)  # (B,T,1152,7)
+            preds = logits.argmax(dim=-1)  # (B, T, 1152)
+            density = (preds != 0).float().mean(dim=-1)  # (B, T)
+            # oczekujemy, że density rosną: density[:, 0] < density[:, 1] < ... < density[:, T-1]
+            # kara za spadki:
+            decay_penalty = torch.relu(density[:, :-1] - density[:, 1:]).mean()
+            # opcjonalnie: kara za zbyt szybki wzrost (np. skok > 0.2)
+            jump_penalty = torch.relu((density[:, 1:] - density[:, :-1]) - 0.2).mean()
+            progress_loss = decay_penalty + jump_penalty
+
+            loss = main_loss + progress_loss
+
+            return logits, loss
+        return logits, None
+
+    def focal_loss(self, logits, targets, gamma=2.0, alpha=None, label_smoothing=0.1):
+        ce_loss = F.cross_entropy(logits, targets, reduction='none', weight=alpha, label_smoothing=label_smoothing)
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** gamma * ce_loss
+        return focal_loss.mean()
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # overfitting happens because of multiplication, not addition
+        # LayerNorm deletes bias after a linear layer anyway
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]       # weights
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]     # biases
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)} with {num_nodecay_params:,} parameters")
+
+        # check if this version of AdamW takes fused as an argument
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        # fused combines a lot of small operations on ensors into a bigger operation
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
+
+import torch
+
+import numpy as np
+import torch
+import numpy as np
+import torch
+import os
+import glob
+import re
+from typing import List, Optional
+import numpy as np
+import torch
+import os
+import glob
+import re
+
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes, split='train',
+                 data_root="../dataset/tokenized", val_frac=0.05):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.split = split
+
+        tree_pattern = os.path.join(data_root, "tree_*")
+        tree_dirs = glob.glob(tree_pattern)
+        if not tree_dirs:
+            raise ValueError(f"No tree directories found under {data_root}")
+
+        def tree_id(path: str) -> int:
+            match = re.search(r'tree_(\d+)$', path)
+            return int(match.group(1)) if match else 0
+        tree_dirs = sorted(tree_dirs, key=tree_id)
+
+        split_idx = int(len(tree_dirs) * (1 - val_frac))
+        if split == 'train':
+            tree_dirs = tree_dirs[:split_idx]
+        else:
+            tree_dirs = tree_dirs[split_idx:]
+        if not tree_dirs:
+            raise ValueError(f"No tree directories for split '{split}'")
+
+        all_frames = []
+        for tree_dir in tree_dirs:
+            frame_files = glob.glob(os.path.join(tree_dir, "frame_*.txt"))
+            if not frame_files:
+                continue
+            def frame_id(path: str) -> int:
+                match = re.search(r'frame_(\d+)\.txt$', path)
+                return int(match.group(1)) if match else 0
+            frame_files = sorted(frame_files, key=frame_id)
+
+            for fname in frame_files:
+                with open(fname, 'r') as f:
+                    content = f.read().strip()
+                digits = re.sub(r'\s+', '', content)
+                vec = np.array([int(c) for c in digits if c.isdigit()], dtype=np.float32)
+                if len(vec) != 24*48:
+                    if len(vec) < 24*48:
+                        vec = np.pad(vec, (0, 24*48 - len(vec)))
+                    else:
+                        vec = vec[:24*48]
+                all_frames.append(vec.astype(np.float32))
+
+        if not all_frames:
+            raise ValueError(f"No frames loaded for split '{split}'")
+
+        self.frames = np.stack(all_frames, axis=0)   # (N, 1152)
+        self.num_frames = self.frames.shape[0]
+
+        if self.num_frames < B * T + 1:
+            raise ValueError(
+                f"Dataset has only {self.num_frames} frames, "
+                f"but batch needs {B*T+1} frames (B={B}, T={T}). Reduce B or T."
+            )
+
+        print(f"Loaded {self.num_frames} frames for {split} split")
+        print(f"1 epoch = {self.num_frames // (B * T)} batches")
+
+        self.class_counts = np.bincount(self.frames.flatten().astype(int), minlength=7)
+        self.class_weights = torch.tensor(1.0 / np.sqrt(self.class_counts + 1e-8), dtype=torch.float32)
+        self.class_weights = self.class_weights / self.class_weights.mean()
+
+        self.current_position = (self.B * self.T * self.process_rank) % self.num_frames
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        pos = self.current_position
+
+        # wrapping
+        if pos + B * T + 1 > self.num_frames:
+            pos = (self.B * self.T * self.process_rank) % self.num_frames
+            self.current_position = pos
+
+        # Buffer of (B*T+1) frames
+        buf = self.frames[pos : pos + B * T + 1]   # (B*T+1, 1152)
+        assert buf.shape[0] == B * T + 1, f"Expected {B*T+1}, got {buf.shape[0]}"
+
+        x = torch.from_numpy(buf[:-1]).float().view(B, T, -1)
+        y = torch.from_numpy(buf[1:]).long().view(B, T, -1)
+
+        self.current_position += B * T * self.num_processes
+        if self.current_position >= self.num_frames:
+            self.current_position = (self.B * self.T * self.process_rank) % self.num_frames
+
+        return x, y
