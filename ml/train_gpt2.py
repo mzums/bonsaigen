@@ -78,12 +78,6 @@ class ConvDecoder(nn.Module):
         x = self.conv3(x)
         return x
 
-
-def focal_loss(logits, targets, gamma=2.0, alpha=None):
-    ce_loss = F.cross_entropy(logits, targets, reduction='none', weight=alpha)
-    pt = torch.exp(-ce_loss)
-    return ((1 - pt) ** gamma * ce_loss).mean()
-
 class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
@@ -163,10 +157,10 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 256        # number of frames in context
     vocab_size: int = 7
-    n_layer: int = 4
-    n_head: int = 4
-    n_emb: int = 64
-    frame_dim: int = 24 * 48     # 1152
+    n_layer: int = 8
+    n_head: int = 8
+    n_emb: int = 128
+    #frame_dim: int = 24 * 48     # 1152
 
 
 import torch.nn as nn
@@ -175,36 +169,56 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.frame_encoder = nn.Linear(config.frame_dim, config.n_emb, bias=False)
+        self.frame_encoder = ConvEncoder(config.n_emb)
         self.pos_embedding = nn.Embedding(config.block_size, config.n_emb)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_emb)
         self.register_buffer('class_weights', torch.ones(config.vocab_size))
         
-        self.frame_decoder = nn.Linear(config.n_emb, config.frame_dim * config.vocab_size, bias=False)
+        self.frame_decoder = ConvDecoder(config.n_emb)
         self.apply(self._init_weights)
 
     def forward(self, x, targets=None):
         B, T, _ = x.shape
-        x = self.frame_encoder(x)
+        
+        x = x.view(B * T, 1, 24, 48)
+        x = self.frame_encoder(x)          # (B*T, n_emb)
+        x = x.view(B, T, -1)               # (B, T, n_emb)
+        
         pos = torch.arange(0, T, device=x.device).unsqueeze(0)
         x = x + self.pos_embedding(pos)
         
         for block in self.blocks:
             x = block(x)
-        x = self.ln_f(x)
+        x = self.ln_f(x)                   # (B, T, n_emb)
         
-        # Reshape logits to (B, T, 1152, 7)
-        logits = self.frame_decoder(x)  # (B, T, 1152*7)
-        logits = logits.view(B, T, self.config.frame_dim, self.config.vocab_size)
+        x = x.view(B * T, -1)              # (B*T, n_emb)
+        logits = self.frame_decoder(x)     # (B*T, 7, 24, 48)
+        
+        logits = logits.view(B, T, 7, 24, 48)
+        logits = logits.permute(0, 1, 3, 4, 2)  # (B, T, 24, 48, 7)
+        logits = logits.contiguous().view(B, T, -1, self.config.vocab_size)  # (B, T, 1152, 7)
         
         if targets is not None:
-            # targets must be (B, T, 1152) with integer class indices 0-6
-            loss = focal_loss(logits.view(-1, self.config.vocab_size), targets.view(-1), gamma=2.0, alpha=self.class_weights)
+            main_loss = self.focal_loss(
+                logits.view(-1, self.config.vocab_size),
+                targets.view(-1),
+                gamma=0.8,
+                alpha=self.class_weights
+            )
+            logits_flat = logits.view(B, T, -1, self.config.vocab_size)  # (B,T,1152,7)
+            preds = logits.argmax(dim=-1)  # (B, T, 1152)
+            density = (preds != 0).float().mean(dim=-1)  # (B, T)
+            decay_penalty = torch.relu(density[:, :-1] - density[:, 1:]).mean()
+            jump_penalty = torch.relu((density[:, 1:] - density[:, :-1]) - 0.2).mean()
+            progress_loss = decay_penalty + jump_penalty
+
+            loss = main_loss + progress_loss
+
             return logits, loss
         return logits, None
 
-    def focal_loss(logits, targets, gamma=2.0, alpha=None):
+    def focal_loss(self, logits, targets, gamma=2.0, alpha=None):
         ce_loss = F.cross_entropy(logits, targets, reduction='none', weight=alpha)
         pt = torch.exp(-ce_loss)
         focal_loss = (1 - pt) ** gamma * ce_loss
@@ -328,7 +342,7 @@ class DataLoaderLite:
         print(f"1 epoch = {self.num_frames // (B * T)} batches")
 
         self.class_counts = np.bincount(self.frames.flatten().astype(int), minlength=7)
-        self.class_weights = torch.tensor(1.0 / (self.class_counts + 1e-8), dtype=torch.float)
+        self.class_weights = torch.tensor(1.0 / np.sqrt(self.class_counts + 1e-8), dtype=torch.float32)
         self.class_weights = self.class_weights / self.class_weights.mean()
 
         self.current_position = (self.B * self.T * self.process_rank) % self.num_frames
@@ -444,8 +458,9 @@ raw_model = model.module if ddp else model
 # cosine learning rate decay
 max_lr = 1e-3
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 100
+warmup_steps = 500
+#max_steps = 10000
+max_steps = 2000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -510,6 +525,10 @@ if ddp:
     destroy_process_group()
 
 
+print("Class counts:", train_loader.class_counts)
+print("Class weights:", train_loader.class_weights)
+
+
 #import sys; sys.exit(0)
 
 import os
@@ -566,10 +585,11 @@ with torch.no_grad():
         
         logits, _ = model(generated)   # (1, T, 1152, 7)
         
-        temperature = 0.3
+        temperature = 0.6
         top_k = 5
         
         next_logits = logits[:, -1, :, :] / temperature   # (1, 1152, 7)
+        next_logits = next_logits.view(1, 24*48, 7)
         
         top_k_logits, top_k_indices = torch.topk(next_logits, top_k, dim=-1)
         new_logits = torch.full_like(next_logits, float('-inf'))
@@ -581,7 +601,7 @@ with torch.no_grad():
         next_frame = next_frame_indices.float().unsqueeze(1)
         generated = torch.cat([generated, next_frame], dim=1)
         
-        print(f"Step {step+1}/{num_frames_to_generate}, seq length: {generated.shape[1]}")
+        #print(f"Step {step+1}/{num_frames_to_generate}, seq length: {generated.shape[1]}")
 
 
 output_dir = "generated_frames"
