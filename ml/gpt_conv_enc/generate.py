@@ -18,7 +18,7 @@ def load_checkpoint(path):
     return checkpoint
 
 
-tree_dir = "../dataset/tokenized/tree_0002"
+tree_dir = "../../dataset/tokenized/tree_0003"
 T_start = 4
 num_frames_to_generate = 200
 
@@ -105,7 +105,7 @@ with torch.no_grad():
         masked_logits = torch.full_like(next_logits, float('-inf'))
         masked_logits.scatter_(-1, top_k_indices, top_k_logits)
 
-        temperature = 0.6
+        temperature = 0.2
         scaled_logits = masked_logits / temperature
         scaled_logits = torch.clamp(scaled_logits, min=-100, max=100)
 

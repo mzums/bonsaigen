@@ -62,9 +62,9 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-B = 8    # micro batch size
+B = 32    # micro batch size
 T = 4    # sequence length
-total_batch_size = B * T * 1
+total_batch_size = B * T * 4
 assert total_batch_size % (B * T * ddp_world_size) == 0, "total_batch_size shoudl be divisibel by B * T * ddp_world_size"
 # gradient accumulation
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -93,7 +93,7 @@ if ddp:
 raw_model = model.module if ddp else model
 
 # cosine learning rate decay
-max_lr = 3e-4
+max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
 #max_steps = 10000
@@ -169,7 +169,7 @@ print("Class weights:", train_loader.class_weights)
 #import sys; sys.exit(0)
 
 
-tree_dir = "../dataset/tokenized/tree_0002"
+tree_dir = "../../dataset/tokenized/tree_0002"
 T_start = 4
 num_frames_to_generate = 200
 

@@ -16,66 +16,61 @@ from datetime import datetime
 class ConvEncoder(nn.Module):
     def __init__(self, n_emb):
         super().__init__()
+        self.conv1 = nn.Conv2d(1, 16, 3, padding='same')
+        self.conv2 = nn.Conv2d(16, 32, 3, padding='same')
+        self.conv3 = nn.Conv2d(32, 64, 3, padding='same')
+        self.conv4 = nn.Conv2d(64, n_emb, 3, padding='same')  # 64 -> 256
 
-        self.conv1 = torch.nn.Conv2d(1, 16, 3, padding='same')
-        self.conv2 = torch.nn.Conv2d(16, 32, 3, padding='same')
-        self.conv3 = torch.nn.Conv2d(32, 64, 3, padding='same')
+        self.bn1 = nn.BatchNorm2d(16)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.bn4 = nn.BatchNorm2d(n_emb)
 
-        self.bn1 = torch.nn.BatchNorm2d(16)
-        self.bn2 = torch.nn.BatchNorm2d(32)
-        self.bn3 = torch.nn.BatchNorm2d(64)
-
-        self.maxpool = torch.nn.MaxPool2d(2, 2)
-        self.global_avg_pool = torch.nn.AdaptiveAvgPool2d(1)
-        self.linear = torch.nn.Linear(64, n_emb)
-
-        self.relu = torch.nn.ReLU()
+        self.maxpool = nn.MaxPool2d(2, 2)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-        x = self.conv3(x)
-        x = self.bn3(x)
-        x = self.relu(x)
-        x = self.global_avg_pool(x)
-        x = x.flatten(1)
-        x = self.linear(x)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)                     # -> (16, 12, 24)
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.maxpool(x)                     # -> (32, 6, 12)
+        x = self.relu(self.bn3(self.conv3(x)))  # -> (64, 6, 12)
+        x = self.relu(self.bn4(self.conv4(x)))  # -> (256, 6, 12)
+        x = self.global_avg_pool(x)             # -> (256, 1, 1)
+        x = x.flatten(1)                        # -> (256)
         return x
 
 
 class ConvDecoder(nn.Module):
     def __init__(self, n_emb):
         super().__init__()
+        self.linear = nn.Linear(n_emb, 64 * 6 * 12)  # 256 -> 4608
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        
+        self.conv1 = nn.Conv2d(64, 64, 3, padding='same')
+        self.conv2 = nn.Conv2d(64, 32, 3, padding='same')
+        self.conv3 = nn.Conv2d(32, 16, 3, padding='same')
+        self.conv4 = nn.Conv2d(16, 7, 3, padding='same')    # 7 klas
 
-        self.linear = torch.nn.Linear(n_emb, 64*6*12)
-        self.up = torch.nn.Upsample(scale_factor=2, mode='nearest')
-        self.conv1 = torch.nn.Conv2d(64, 32, 3, padding='same')
-        self.conv2 = torch.nn.Conv2d(32, 16, 3, padding='same')
-        self.conv3 = torch.nn.Conv2d(16, 7, 3, padding='same')
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.bn3 = nn.BatchNorm2d(16)
 
-        self.bn1 = torch.nn.BatchNorm2d(32)
-        self.bn2 = torch.nn.BatchNorm2d(16)
-
-        self.relu = torch.nn.ReLU()
+        self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.linear(x)
         x = x.reshape(-1, 64, 6, 12)
-        x = self.up(x)
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.up(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        x = self.conv3(x)
+        
+        x = self.up(x)                       # -> (64, 12, 24)
+        x = self.relu(self.bn1(self.conv1(x)))
+        
+        x = self.up(x)                       # -> (64, 24, 48)
+        x = self.relu(self.bn2(self.conv2(x)))
+        
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = self.conv4(x)                    # -> (7, 24, 48)
         return x
 
 class CausalSelfAttention(nn.Module):
@@ -159,7 +154,7 @@ class GPTConfig:
     vocab_size: int = 7
     n_layer: int = 8
     n_head: int = 8
-    n_emb: int = 128
+    n_emb: int = 512
     #frame_dim: int = 24 * 48     # 1152
 
 
@@ -195,34 +190,45 @@ class GPT(nn.Module):
             x = block(x)
         x = self.ln_f(x)                   # (B, T, n_emb)
         
-        # Dekoder
+        # Decoder
         x = x.view(B * T, -1)              # (B*T, n_emb)
         logits = self.frame_decoder(x)     # (B*T, 7, 24, 48)
         
-        # Przekształcenie na (B, T, 1152, 7)
         logits = logits.view(B, T, 7, 24, 48)
         logits = logits.permute(0, 1, 3, 4, 2)  # (B, T, 24, 48, 7)
         logits = logits.contiguous().view(B, T, -1, self.config.vocab_size)  # (B, T, 1152, 7)
         
         if targets is not None:
             logits = logits / 2.0
+            
             main_loss = self.focal_loss(
                 logits.view(-1, self.config.vocab_size),
                 targets.view(-1),
-                gamma=0.8,
+                gamma=2.5,
                 alpha=self.class_weights
             )
+            
             logits_flat = logits.view(B, T, -1, self.config.vocab_size)  # (B,T,1152,7)
             preds = logits.argmax(dim=-1)  # (B, T, 1152)
             density = (preds != 0).float().mean(dim=-1)  # (B, T)
-            # oczekujemy, że density rosną: density[:, 0] < density[:, 1] < ... < density[:, T-1]
-            # kara za spadki:
             decay_penalty = torch.relu(density[:, :-1] - density[:, 1:]).mean()
-            # opcjonalnie: kara za zbyt szybki wzrost (np. skok > 0.2)
             jump_penalty = torch.relu((density[:, 1:] - density[:, :-1]) - 0.2).mean()
             progress_loss = decay_penalty + jump_penalty
 
-            loss = main_loss + progress_loss
+            WOOD_CLASSES = [1, 2, 3, 4, 5]
+            
+            probs = F.softmax(logits, dim=-1)          # (B, T, 1152, 7)
+            wood_prob = probs[..., WOOD_CLASSES].sum(dim=-1)  # (B, T, 1152)
+            wood_prob = wood_prob.view(B, T, 24, 48)   # (B, T, 24, 48)
+
+            grad_h = torch.abs(wood_prob[:, :, 1:, :] - wood_prob[:, :, :-1, :])  # pion
+            grad_w = torch.abs(wood_prob[:, :, :, 1:] - wood_prob[:, :, :, :-1])  # poziom
+            
+            mean_grad = (grad_h.mean() + grad_w.mean()) / 2.0
+            
+            shape_loss = torch.exp(-mean_grad * 5.0)
+
+            loss = main_loss + 0.2 * shape_loss
 
             return logits, loss
         return logits, None
@@ -288,7 +294,7 @@ import re
 
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split='train',
-                 data_root="../dataset/tokenized", val_frac=0.05):
+                 data_root="../../dataset/tokenized", val_frac=0.05):
         self.B = B
         self.T = T
         self.process_rank = process_rank

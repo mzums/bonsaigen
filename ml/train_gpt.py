@@ -13,11 +13,6 @@ from datetime import datetime
 # ---------------------------------------------
 
 
-def focal_loss(logits, targets, gamma=2.0, alpha=None):
-    ce_loss = F.cross_entropy(logits, targets, reduction='none', weight=alpha)
-    pt = torch.exp(-ce_loss)
-    return ((1 - pt) ** gamma * ce_loss).mean()
-
 class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
@@ -134,7 +129,7 @@ class GPT(nn.Module):
         
         if targets is not None:
             # targets must be (B, T, 1152) with integer class indices 0-6
-            loss = focal_loss(logits.view(-1, self.config.vocab_size), targets.view(-1), gamma=2.0, alpha=self.class_weights)
+            loss = self.focal_loss(logits.view(-1, self.config.vocab_size), targets.view(-1), gamma=2.0, alpha=self.class_weights)
             return logits, loss
         return logits, None
 
