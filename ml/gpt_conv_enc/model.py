@@ -357,8 +357,12 @@ class DataLoaderLite:
         print(f"1 epoch = {self.num_frames // (B * T)} batches")
 
         self.class_counts = np.bincount(self.frames.flatten().astype(int), minlength=7)
-        self.class_weights = torch.tensor(1.0 / np.sqrt(self.class_counts + 1e-8), dtype=torch.float32)
+        #self.class_weights = torch.tensor(1.0 / (self.class_counts + 1e-8), dtype=torch.float32)
+        # smaller alpha is more spaces
+        alpha = 0.32
+        self.class_weights = torch.tensor(1.0 / np.power(self.class_counts + 1e-8, alpha), dtype=torch.float32)
         self.class_weights = self.class_weights / self.class_weights.mean()
+        #self.class_weights = torch.ones(7, dtype=torch.float32)
 
         self.current_position = (self.B * self.T * self.process_rank) % self.num_frames
 
