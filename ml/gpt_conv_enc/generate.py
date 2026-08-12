@@ -53,7 +53,7 @@ context = context.to('cuda')
 print(f"Context shape: {context.shape}")  # torch.Size([1, 4, 1152])
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-checkpoint = load_checkpoint("bonsai_model.pt")
+checkpoint = load_checkpoint("bonsai_model2.pt")
 config = checkpoint['config']
 print("\nCreating model...")
 model = GPT(config)
@@ -99,13 +99,13 @@ with torch.no_grad():
         logits, _ = model(generated)          # (1, T, 1152, 7)
         next_logits = logits[:, -1, :, :]     # (1, 1152, 7)
 
-        top_k = 5
+        top_k = 2
         top_k_logits, top_k_indices = torch.topk(next_logits, top_k, dim=-1)
 
         masked_logits = torch.full_like(next_logits, float('-inf'))
         masked_logits.scatter_(-1, top_k_indices, top_k_logits)
 
-        temperature = 0.2
+        temperature = 0.9
         scaled_logits = masked_logits / temperature
         scaled_logits = torch.clamp(scaled_logits, min=-100, max=100)
 

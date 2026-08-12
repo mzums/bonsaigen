@@ -17,7 +17,7 @@ from model import DataLoaderLite, GPTConfig, GPT, ConvEncoder, ConvDecoder
 def evaluate_loss(model, val_loader, grad_accum_steps, device, ddp):
     model.eval()
     loss_accum = 0.0
-    num_batches = 20  # num bathes toaverage
+    num_batches = 20  # num bathes to average
     val_loader.current_position = val_loader.B * val_loader.T * val_loader.process_rank
     for micro_step in range(num_batches):
         x, y = val_loader.next_batch()
@@ -96,8 +96,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
-#max_steps = 10000
-max_steps = 10000
+max_steps = 100000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -156,7 +155,7 @@ if master_process:
     torch.save({
     'model_state_dict': raw_model.state_dict(),
     'config': config
-}, "bonsai_model.pt")
+}, "bonsai_model2.pt")
 
 if ddp:
     destroy_process_group()
@@ -260,7 +259,7 @@ with torch.no_grad():
         generated = torch.cat([generated, next_frame], dim=1)
         
 
-output_dir = "generated_frames"
+output_dir = "generated_frames2"
 os.makedirs(output_dir, exist_ok=True)
 
 mapping = {
