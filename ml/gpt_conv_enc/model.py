@@ -22,8 +22,7 @@ class ConvEncoder(nn.Module):
         self.bn2 = nn.BatchNorm2d(32)
         self.bn3 = nn.BatchNorm2d(64)
         self.maxpool = nn.MaxPool2d(2, 2)
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.linear = nn.Linear(64, n_emb)  # back
+        self.linear = nn.Linear(64*6*12, n_emb)  # back
         self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -32,7 +31,6 @@ class ConvEncoder(nn.Module):
         x = self.relu(self.bn2(self.conv2(x)))
         x = self.maxpool(x)
         x = self.relu(self.bn3(self.conv3(x)))
-        x = self.global_avg_pool(x)
         x = x.flatten(1)
         x = self.linear(x)
         return x  # (B*T, n_emb)
@@ -41,26 +39,25 @@ class ConvEncoder(nn.Module):
 class ConvDecoder(nn.Module):
     def __init__(self, n_emb):
         super().__init__()
-        self.linear = nn.Linear(n_emb, 64 * 6 * 12)
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv1 = nn.Conv2d(64, 64, 3, padding='same')
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv2 = nn.Conv2d(64, 32, 3, padding='same')
-        self.conv3 = nn.Conv2d(32, 16, 3, padding='same')
-        self.conv4 = nn.Conv2d(16, 7, 3, padding='same')
+        self.fc = nn.Linear(n_emb, 64 * 6 * 12)
+        self.conv_up1 = nn.Conv2d(64, 64*4, kernel_size=3, padding='same')
+        self.conv_up2 = nn.Conv2d(64, 32*4, kernel_size=3, padding='same')
+        self.conv1 = nn.Conv2d(32, 16, kernel_size=3, padding='same')
+        self.conv2 = nn.Conv2d(16, 7, kernel_size=3, padding='same')
+        self.shuffle = nn.PixelShuffle(2)
         self.relu = nn.ReLU()
-        # no BatchNorm
 
     def forward(self, x):
-        x = self.linear(x)
+        x = self.fc(x)
         x = x.reshape(-1, 64, 6, 12)
-        x = self.up1(x)
-        x = self.relu(self.conv1(x))
-        x = self.up2(x)
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        x = self.conv4(x)
-        return x  # (B*T, 7, 24, 48)
+        
+        x = self.relu(self.conv_up1(x))   # (B, 256, 6, 12)
+        x = self.shuffle(x)               # (B, 64, 12, 24)
+        x = self.relu(self.conv_up2(x))   # (B, 128, 12, 24)
+        x = self.shuffle(x)               # (B, 32, 24, 48)
+        x = self.relu(self.conv1(x))      # (B, 16, 24, 48)
+        x = self.conv2(x)                 # (B, 7, 24, 48)
+        return x
     
 
 class CausalSelfAttention(nn.Module):
@@ -213,7 +210,7 @@ class GPT(nn.Module):
             mean_grad = (grad_h.mean() + grad_w.mean()) / 2.0
             shape_loss = torch.exp(-mean_grad * 8.0)
 
-            loss = main_loss + 0.2 * shape_loss
+            loss = main_loss + 0.1 * shape_loss + 0.1 * progress_loss
 
             return logits, loss
         return logits, None
@@ -345,7 +342,7 @@ class DataLoaderLite:
         #self.class_weights = torch.tensor(1.0 / (self.class_counts + 1e-8), dtype=torch.float32)
         # smaller alpha is more spaces
         # alpha = 0.32 for 10k steps
-        alpha = 0.45
+        alpha = 0.35
         self.class_weights = torch.tensor(1.0 / np.power(self.class_counts + 1e-8, alpha), dtype=torch.float32)
         self.class_weights = self.class_weights / self.class_weights.mean()
         #self.class_weights = torch.ones(7, dtype=torch.float32)
