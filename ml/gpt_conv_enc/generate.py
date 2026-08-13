@@ -105,7 +105,7 @@ with torch.no_grad():
         masked_logits = torch.full_like(next_logits, float('-inf'))
         masked_logits.scatter_(-1, top_k_indices, top_k_logits)
 
-        temperature = 1.2
+        temperature = 1.5
         scaled_logits = masked_logits / temperature
         scaled_logits = torch.clamp(scaled_logits, min=-100, max=100)
 
@@ -117,7 +117,7 @@ with torch.no_grad():
         generated = torch.cat([generated, next_frame], dim=1)
         
 
-output_dir = "generated_frames"
+output_dir = "generated_frames3"
 os.makedirs(output_dir, exist_ok=True)
 
 mapping = {

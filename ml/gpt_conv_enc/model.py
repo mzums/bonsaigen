@@ -15,14 +15,15 @@ from datetime import datetime
 class ConvEncoder(nn.Module):
     def __init__(self, n_emb):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, 3, padding='same')
-        self.conv2 = nn.Conv2d(16, 32, 3, padding='same')
-        self.conv3 = nn.Conv2d(32, 64, 3, padding='same')
-        self.bn1 = nn.BatchNorm2d(16)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.bn3 = nn.BatchNorm2d(64)
+        self.conv1 = nn.Conv2d(1, 32, 3, padding='same')
+        self.conv2 = nn.Conv2d(32, 64, 3, padding='same')
+        self.conv3 = nn.Conv2d(64, 128, 3, padding='same')
+        self.bn1 = nn.BatchNorm2d(32)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
         self.maxpool = nn.MaxPool2d(2, 2)
-        self.linear = nn.Linear(64*6*12, n_emb)  # back
+        # Flatten: 128 * 6 * 12 = 9216
+        self.linear = nn.Linear(128 * 6 * 12, n_emb)  
         self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -31,32 +32,35 @@ class ConvEncoder(nn.Module):
         x = self.relu(self.bn2(self.conv2(x)))
         x = self.maxpool(x)
         x = self.relu(self.bn3(self.conv3(x)))
-        x = x.flatten(1)
-        x = self.linear(x)
-        return x  # (B*T, n_emb)
+        # x shape: (B*T, 128, 6, 12)
+        x = x.flatten(1)          # (B*T, 9216)
+        x = self.linear(x)        # (B*T, n_emb)
+        return x
     
 
 class ConvDecoder(nn.Module):
     def __init__(self, n_emb):
         super().__init__()
-        self.fc = nn.Linear(n_emb, 64 * 6 * 12)
-        self.conv_up1 = nn.Conv2d(64, 64*4, kernel_size=3, padding='same')
-        self.conv_up2 = nn.Conv2d(64, 32*4, kernel_size=3, padding='same')
-        self.conv1 = nn.Conv2d(32, 16, kernel_size=3, padding='same')
-        self.conv2 = nn.Conv2d(16, 7, kernel_size=3, padding='same')
-        self.shuffle = nn.PixelShuffle(2)
+        self.fc = nn.Linear(n_emb, 128 * 6 * 12)
+        
+        # upsampling: 6x12 -> 12x24
+        self.deconv1 = nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1)
+        # upsampling: 12x24 -> 24x48
+        self.deconv2 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
+        
+        self.conv1 = nn.Conv2d(64, 32, kernel_size=3, padding='same')
+        self.conv2 = nn.Conv2d(32, 7, kernel_size=3, padding='same')
+        
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.fc(x)
-        x = x.reshape(-1, 64, 6, 12)
+        x = x.reshape(-1, 128, 6, 12)   # (B*T, 128, 6, 12)
         
-        x = self.relu(self.conv_up1(x))   # (B, 256, 6, 12)
-        x = self.shuffle(x)               # (B, 64, 12, 24)
-        x = self.relu(self.conv_up2(x))   # (B, 128, 12, 24)
-        x = self.shuffle(x)               # (B, 32, 24, 48)
-        x = self.relu(self.conv1(x))      # (B, 16, 24, 48)
-        x = self.conv2(x)                 # (B, 7, 24, 48)
+        x = self.relu(self.deconv1(x))   # (B*T, 128, 12, 24)
+        x = self.relu(self.deconv2(x))   # (B*T, 64, 24, 48)
+        x = self.relu(self.conv1(x))     # (B*T, 32, 24, 48)
+        x = self.conv2(x)                # (B*T, 7, 24, 48)
         return x
     
 
@@ -68,6 +72,8 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_emb, 3*config.n_emb)
         self.c_proj = nn.Linear(config.n_emb, config.n_emb)
         self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.proj_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_emb = config.n_emb
         # buffer because it should be constant, it's not a parameter
@@ -100,6 +106,7 @@ class CausalSelfAttention(nn.Module):
         # transpose doesn't physically revert data, only changes metadata and shape but view requires contiguous data so we must physically revert the data
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
+        y = self.proj_dropout(y)
         return y
 
 
@@ -112,11 +119,13 @@ class MLP(nn.Module):
         self.gelu   = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_emb, config.n_emb)
         self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
+        x = self.dropout(x)
         return x
 
 
@@ -129,20 +138,21 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_emb)
         self.mlp = MLP(config)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))     # residual connection
-        x = x + self.mlp(self.ln_2(x))      # residual connection
+        x = x + self.dropout(self.attn(self.ln_1(x)))     # residual connection
+        x = x + self.dropout(self.mlp(self.ln_2(x)))      # residual connection
         return x
 
 @dataclass
 class GPTConfig:
-    block_size: int = 4096        # number of frames in context
+    block_size: int = 256        # number of frames in context
     vocab_size: int = 7
-    n_layer: int = 8
-    n_head: int = 8
-    n_emb: int = 512
-    #frame_dim: int = 24 * 48     # 1152
+    n_layer: int = 12
+    n_head: int = 12
+    n_emb: int = 768
+    dropout: float = 0.1
 
 
 import torch.nn as nn
@@ -210,7 +220,7 @@ class GPT(nn.Module):
             mean_grad = (grad_h.mean() + grad_w.mean()) / 2.0
             shape_loss = torch.exp(-mean_grad * 8.0)
 
-            loss = main_loss + 0.1 * shape_loss + 0.1 * progress_loss
+            loss = main_loss + 0.0 * shape_loss + 0.1 * progress_loss
 
             return logits, loss
         return logits, None
@@ -342,7 +352,7 @@ class DataLoaderLite:
         #self.class_weights = torch.tensor(1.0 / (self.class_counts + 1e-8), dtype=torch.float32)
         # smaller alpha is more spaces
         # alpha = 0.32 for 10k steps
-        alpha = 0.35
+        alpha = 0.2
         self.class_weights = torch.tensor(1.0 / np.power(self.class_counts + 1e-8, alpha), dtype=torch.float32)
         self.class_weights = self.class_weights / self.class_weights.mean()
         #self.class_weights = torch.ones(7, dtype=torch.float32)

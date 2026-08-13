@@ -95,8 +95,8 @@ raw_model = model.module if ddp else model
 # cosine learning rate decay
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 1000
-max_steps = 150000
+warmup_steps = 500
+max_steps = 2000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -108,7 +108,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.2, learning_rate=6e-4, device=device)
 
 
 for step in range(max_steps):
