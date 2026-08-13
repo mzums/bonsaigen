@@ -18,50 +18,49 @@ class ConvEncoder(nn.Module):
         self.conv1 = nn.Conv2d(1, 16, 3, padding='same')
         self.conv2 = nn.Conv2d(16, 32, 3, padding='same')
         self.conv3 = nn.Conv2d(32, 64, 3, padding='same')
-        self.conv4 = nn.Conv2d(64, 128, 3, padding='same')
-        self.conv5 = nn.Conv2d(128, n_emb, 3, padding='same')
         self.bn1 = nn.BatchNorm2d(16)
         self.bn2 = nn.BatchNorm2d(32)
         self.bn3 = nn.BatchNorm2d(64)
-        self.bn4 = nn.BatchNorm2d(128)
-        self.bn5 = nn.BatchNorm2d(n_emb)
         self.maxpool = nn.MaxPool2d(2, 2)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.linear = nn.Linear(64, n_emb)  # back
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)                     # 12x24
+        x = self.maxpool(x)
         x = self.relu(self.bn2(self.conv2(x)))
-        x = self.maxpool(x)                     # 6x12
+        x = self.maxpool(x)
         x = self.relu(self.bn3(self.conv3(x)))
-        x = self.maxpool(x)                     # 3x6
-        x = self.relu(self.bn4(self.conv4(x)))
-        x = self.relu(self.bn5(self.conv5(x)))  # (n_emb, 3, 6)
-        return x
+        x = self.global_avg_pool(x)
+        x = x.flatten(1)
+        x = self.linear(x)
+        return x  # (B*T, n_emb)
     
 
 class ConvDecoder(nn.Module):
     def __init__(self, n_emb):
         super().__init__()
-        # input: (B*T, n_emb, 3, 6)
-        self.conv1 = nn.Conv2d(n_emb, 64, kernel_size=3, padding='same')
+        self.linear = nn.Linear(n_emb, 64 * 6 * 12)
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv2 = nn.Conv2d(64, 32, kernel_size=3, padding='same')
+        self.conv1 = nn.Conv2d(64, 64, 3, padding='same')
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv3 = nn.Conv2d(32, 16, kernel_size=3, padding='same')
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv4 = nn.Conv2d(16, 7, kernel_size=3, padding='same')
+        self.conv2 = nn.Conv2d(64, 32, 3, padding='same')
+        self.conv3 = nn.Conv2d(32, 16, 3, padding='same')
+        self.conv4 = nn.Conv2d(16, 7, 3, padding='same')
         self.relu = nn.ReLU()
+        # no BatchNorm
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))      # (B*T, 64, 3, 6)
-        x = self.up1(x)                   # (B*T, 64, 6, 12)
-        x = self.relu(self.conv2(x))      # (B*T, 32, 6, 12)
-        x = self.up2(x)                   # (B*T, 32, 12, 24)
-        x = self.relu(self.conv3(x))      # (B*T, 16, 12, 24)
-        x = self.up3(x)                   # (B*T, 16, 24, 48)
-        x = self.conv4(x)                 # (B*T, 7, 24, 48)
-        return x
+        x = self.linear(x)
+        x = x.reshape(-1, 64, 6, 12)
+        x = self.up1(x)
+        x = self.relu(self.conv1(x))
+        x = self.up2(x)
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        x = self.conv4(x)
+        return x  # (B*T, 7, 24, 48)
     
 
 class CausalSelfAttention(nn.Module):
@@ -166,39 +165,24 @@ class GPT(nn.Module):
 
     def forward(self, x, targets=None):
         B, T, _ = x.shape
-
-        # encoder outputs a 2d map
         x = x.view(B * T, 1, 24, 48)
-        x = self.frame_encoder(x)                # (B*T, n_emb, 3, 6)
-        _, C, H, W = x.shape   # C = n_emb, H=3, W=6
-
-        # flatten to a token sequence
-        x = x.permute(0, 2, 3, 1)                # (B*T, H, W, C)
-        x = x.contiguous().view(B, T * H * W, C) # (B, seq_len, C)
-        seq_len = x.size(1)
-
-        # dynamic positional embeddings
-        pos = torch.arange(0, seq_len, device=x.device).unsqueeze(0)
-        x = x + self.pos_embedding(pos)
-
-        # transformer
+        x = self.frame_encoder(x)          # (B*T, n_emb)
+        x = x.view(B, T, -1)               # (B, T, n_emb)
+        
+        pos = torch.arange(0, T, device=x.device).unsqueeze(0)
+        x = x + self.pos_embedding(pos)    # T musi być <= block_size
+        
         for block in self.blocks:
             x = block(x)
-        x = self.ln_f(x)  # (B, seq_len, C)
-
-        # change to map again
-        x = x.view(B, T, H, W, C)
-        x = x.permute(0, 1, 4, 2, 3)             # (B, T, C, H, W)
-        x = x.contiguous().view(B * T, C, H, W)  # (B*T, C, H, W)
-
-        # decoder outputs logits
-        logits = self.frame_decoder(x)            # (B*T, 7, 24, 48)
-
-        # reshape to (B, T, 1152, 7)
+        x = self.ln_f(x)                   # (B, T, n_emb)
+        
+        x = x.view(B * T, -1)              # (B*T, n_emb)
+        logits = self.frame_decoder(x)     # (B*T, 7, 24, 48)
+        
         logits = logits.view(B, T, 7, 24, 48)
-        logits = logits.permute(0, 1, 3, 4, 2)   # (B, T, 24, 48, 7)
-        logits = logits.contiguous().view(B, T, -1, self.config.vocab_size)  # (B, T, 1152, 7)
-
+        logits = logits.permute(0, 1, 3, 4, 2)
+        logits = logits.contiguous().view(B, T, -1, self.config.vocab_size)
+        
         if targets is not None:
             targets = torch.clamp(targets, 0, self.config.vocab_size - 1)
             logits = logits / 2.0
@@ -361,7 +345,7 @@ class DataLoaderLite:
         #self.class_weights = torch.tensor(1.0 / (self.class_counts + 1e-8), dtype=torch.float32)
         # smaller alpha is more spaces
         # alpha = 0.32 for 10k steps
-        alpha = 0.2
+        alpha = 0.45
         self.class_weights = torch.tensor(1.0 / np.power(self.class_counts + 1e-8, alpha), dtype=torch.float32)
         self.class_weights = self.class_weights / self.class_weights.mean()
         #self.class_weights = torch.ones(7, dtype=torch.float32)

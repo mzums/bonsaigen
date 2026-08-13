@@ -96,7 +96,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 1000
-max_steps = 100000
+max_steps = 150000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -155,7 +155,7 @@ if master_process:
     torch.save({
     'model_state_dict': raw_model.state_dict(),
     'config': config
-}, "bonsai_model2.pt")
+}, "bonsai_model.pt")
 
 if ddp:
     destroy_process_group()
@@ -259,7 +259,7 @@ with torch.no_grad():
         generated = torch.cat([generated, next_frame], dim=1)
         
 
-output_dir = "generated_frames2"
+output_dir = "generated_frames"
 os.makedirs(output_dir, exist_ok=True)
 
 mapping = {
