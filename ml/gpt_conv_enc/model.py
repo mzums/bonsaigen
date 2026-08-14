@@ -23,44 +23,41 @@ class ConvEncoder(nn.Module):
         self.bn3 = nn.BatchNorm2d(128)
         self.maxpool = nn.MaxPool2d(2, 2)
         # Flatten: 128 * 6 * 12 = 9216
-        self.linear = nn.Linear(128 * 6 * 12, n_emb)  
+        self.fc1 = nn.Linear(128 * 6 * 12, 1024)
+        self.fc2 = nn.Linear(1024, n_emb)
+        self.dropout = nn.Dropout(0.2)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
+        x = self.maxpool(x)               # 12x24
         x = self.relu(self.bn2(self.conv2(x)))
-        x = self.maxpool(x)
-        x = self.relu(self.bn3(self.conv3(x)))
-        # x shape: (B*T, 128, 6, 12)
-        x = x.flatten(1)          # (B*T, 9216)
-        x = self.linear(x)        # (B*T, n_emb)
+        x = self.maxpool(x)               # 6x12
+        x = self.relu(self.bn3(self.conv3(x)))  # bez maxpool
+        x = x.flatten(1)
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
         return x
     
 
 class ConvDecoder(nn.Module):
     def __init__(self, n_emb):
         super().__init__()
-        self.fc = nn.Linear(n_emb, 128 * 6 * 12)
-        
-        # upsampling: 6x12 -> 12x24
-        self.deconv1 = nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1)
-        # upsampling: 12x24 -> 24x48
-        self.deconv2 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
-        
+        self.fc = nn.Linear(n_emb, 128 * 6 * 12)  # dostosuj kanały
+        self.deconv1 = nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1)  # 6->12
+        self.deconv2 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)   # 12->24
         self.conv1 = nn.Conv2d(64, 32, kernel_size=3, padding='same')
         self.conv2 = nn.Conv2d(32, 7, kernel_size=3, padding='same')
-        
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.fc(x)
-        x = x.reshape(-1, 128, 6, 12)   # (B*T, 128, 6, 12)
-        
-        x = self.relu(self.deconv1(x))   # (B*T, 128, 12, 24)
-        x = self.relu(self.deconv2(x))   # (B*T, 64, 24, 48)
-        x = self.relu(self.conv1(x))     # (B*T, 32, 24, 48)
-        x = self.conv2(x)                # (B*T, 7, 24, 48)
+        x = x.reshape(-1, 128, 6, 12)
+        x = self.relu(self.deconv1(x))
+        x = self.relu(self.deconv2(x))
+        x = self.relu(self.conv1(x))
+        x = self.conv2(x)   # (B*T, 7, 24, 48)
         return x
     
 
@@ -152,7 +149,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_emb: int = 768
-    dropout: float = 0.1
+    dropout: float = 0.2
 
 
 import torch.nn as nn
@@ -212,6 +209,9 @@ class GPT(nn.Module):
             # Shape loss
             WOOD_CLASSES = [1, 2, 3, 4, 5]
             probs = F.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+            entropy_penalty = -0.01 * entropy
+
             wood_prob = probs[..., WOOD_CLASSES].sum(dim=-1)
             wood_prob = wood_prob.view(B, T, 24, 48)
 
@@ -220,7 +220,7 @@ class GPT(nn.Module):
             mean_grad = (grad_h.mean() + grad_w.mean()) / 2.0
             shape_loss = torch.exp(-mean_grad * 8.0)
 
-            loss = main_loss + 0.0 * shape_loss + 0.1 * progress_loss
+            loss = main_loss + 0.0 * shape_loss + 0.1 * progress_loss + entropy_penalty
 
             return logits, loss
         return logits, None
@@ -352,7 +352,7 @@ class DataLoaderLite:
         #self.class_weights = torch.tensor(1.0 / (self.class_counts + 1e-8), dtype=torch.float32)
         # smaller alpha is more spaces
         # alpha = 0.32 for 10k steps
-        alpha = 0.2
+        alpha = 0.18
         self.class_weights = torch.tensor(1.0 / np.power(self.class_counts + 1e-8, alpha), dtype=torch.float32)
         self.class_weights = self.class_weights / self.class_weights.mean()
         #self.class_weights = torch.ones(7, dtype=torch.float32)

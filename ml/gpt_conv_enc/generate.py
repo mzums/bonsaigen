@@ -4,6 +4,7 @@ import glob
 import re
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from model import GPT, ConvEncoder, ConvDecoder
 
@@ -64,11 +65,16 @@ for name, param in model.named_parameters():
 
 model.to(device)
 
+temperature = 1.0
+
 with torch.no_grad():
     # Use the first 4 frames as context, predict the 5th
     test_input = context   # (1, 4, 1152)
     logits, _ = model(test_input)
-    pred = logits[:, -1, :, :].argmax(dim=-1)   # (1, 1152)
+    #pred = logits[:, -1, :, :].argmax(dim=-1)   # (1, 1152)
+
+    probs = F.softmax(logits / temperature, dim=-1)
+    pred = torch.multinomial(probs.view(-1, 7), num_samples=1).view(probs.shape[:-1])
 
     # Load the true 5th frame (index 4) from the same dataset
     true_frame_path = frame_files[4]   # assuming your sorted list has it
@@ -105,7 +111,6 @@ with torch.no_grad():
         masked_logits = torch.full_like(next_logits, float('-inf'))
         masked_logits.scatter_(-1, top_k_indices, top_k_logits)
 
-        temperature = 1.5
         scaled_logits = masked_logits / temperature
         scaled_logits = torch.clamp(scaled_logits, min=-100, max=100)
 
@@ -117,7 +122,7 @@ with torch.no_grad():
         generated = torch.cat([generated, next_frame], dim=1)
         
 
-output_dir = "generated_frames3"
+output_dir = "generated_frames"
 os.makedirs(output_dir, exist_ok=True)
 
 mapping = {

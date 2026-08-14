@@ -23,3 +23,10 @@ Encoder with linear but without GAP, Decoder with PixelShuffle, without BN after
 No shape_loss, bigger encoder (128 channels), dropout added, bigger emb, ater 2k steps
 ![alt text](images/image-10.png)
 ![alt text](images/image-11.png)
+
+
+Encoder with FC layers, dropout in enc, entropy penalty
+![alt text](images/image-12.png)
+![alt text](images/image-13.png)
+*generates only these two two types of images*
+*gradient noise made the results worse*
