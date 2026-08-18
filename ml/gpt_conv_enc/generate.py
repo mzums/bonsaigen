@@ -137,6 +137,9 @@ mapping = {
 
 num_frames = generated.shape[1]
 
+f = open("../../get_data/base.txt")
+base = f.read()
+
 for i in range(num_frames):
     frame_vec = generated[0, i, :].cpu().numpy()            # (1152,)                             # denormalize
     frame_vec = frame_vec.astype(int)
@@ -159,6 +162,7 @@ for i in range(num_frames):
         lines.append(''.join(line_chars))
 
     content = '\n'.join(lines)
+    content += '\n' + base
     
     filename = os.path.join(output_dir, f"frame_{i:04d}.txt")
     with open(filename, 'w') as f:

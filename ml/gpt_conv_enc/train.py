@@ -93,10 +93,10 @@ if ddp:
 raw_model = model.module if ddp else model
 
 # cosine learning rate decay
-max_lr = 6e-4
+max_lr = 3e-4
 min_lr = max_lr * 0.1
 warmup_steps = 500
-max_steps = 2000
+max_steps = 3000
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -146,7 +146,7 @@ for step in range(max_steps):
             f"dt: {dt:.2f}s, tok/sec: {tokens_per_sec:.2f}"
         )
 
-    if step % 1000 == 0 and master_process:
+    if (step+1) % 1000 == 0 and master_process:
         val_loss = evaluate_loss(raw_model, val_loader, grad_accum_steps, device, ddp)
         print(f"\nstep {step} | validation loss: {val_loss:.6f}\n")
 
