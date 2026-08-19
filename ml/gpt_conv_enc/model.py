@@ -251,10 +251,10 @@ class GPT(nn.Module):
                 padding=2
             ) * 25.0
 
-            large_wood_loss = F.relu(wood_count_5x5 - 16.0).mean()
+            large_wood_loss = F.relu(wood_count_5x5 - 20.0).mean()
 
 
-            loss = main_loss + 0.3 * shape_loss + 0.1 * progress_loss + 0.5 * entropy_penalty + 10.0 * isolated_loss + 0.05 * large_wood_loss
+            loss = main_loss + 0.3 * shape_loss + 0.1 * progress_loss + 0.2 * entropy_penalty + 5.0 * isolated_loss + 0.1 * large_wood_loss
 
             return logits, loss
         return logits, None
