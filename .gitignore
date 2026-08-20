@@ -1,3 +1,5 @@
 dataset/*
 dataset
 bonsai_model.pt
+ml/generated_frames/*
+*/*/__pycache__

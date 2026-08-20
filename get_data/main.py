@@ -12,7 +12,7 @@ COLS = 48
 ROWS = 28
 MAX_FRAMES = 300
 
-os.makedirs("../dataset/raw", exist_ok=True)
+os.makedirs("../dataset/raw2", exist_ok=True)
 
 for tree in range(1000):
     screen = pyte.Screen(COLS, ROWS)
@@ -51,7 +51,7 @@ for tree in range(1000):
         current = "\n".join(screen.display[:-4])
 
         if current != previous:
-            folder = Path(f"../dataset/raw/tree_{tree:04d}")
+            folder = Path(f"../dataset/raw2/tree_{tree:04d}")
             folder.mkdir(parents=True, exist_ok=True)
 
             with open(folder / f"frame_{frame:04d}.txt", "w") as f:
