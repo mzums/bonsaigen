@@ -93,7 +93,7 @@ if ddp:
 raw_model = model.module if ddp else model
 
 # cosine learning rate decay
-max_lr = 3e-4
+max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 500
 max_steps = 3000
@@ -219,96 +219,3 @@ with torch.no_grad():
 
     accuracy = (pred[0] == true_tensor).float().mean().item()
     print(f"Next‑frame prediction accuracy: {accuracy:.2%}")
-    
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
-model.eval()
-generated = context
-
-max_len = config.block_size
-if context.shape[1] > max_len:
-    raise ValueError(f"Context length {context.shape[1]} > block_size {max_len}")
-
-with torch.no_grad():
-    for step in range(num_frames_to_generate):
-        if generated.shape[1] >= max_len:
-            break
-
-        logits, _ = model(generated)          # (1, T, 1152, 7)
-        next_logits = logits[:, -1, :, :]     # (1, 1152, 7)
-
-        # ---- top‑k first (no temperature) ----
-        top_k = 5
-        top_k_logits, top_k_indices = torch.topk(next_logits, top_k, dim=-1)
-
-        masked_logits = torch.full_like(next_logits, float('-inf'))
-        masked_logits.scatter_(-1, top_k_indices, top_k_logits)
-
-        # ---- now apply temperature and clamp ----
-        temperature = 0.6
-        scaled_logits = masked_logits / temperature
-        scaled_logits = torch.clamp(scaled_logits, min=-100, max=100)   # safe range
-
-        # ---- softmax (no NaN) ----
-        probs = torch.softmax(scaled_logits, dim=-1)   # (1, 1152, 7)
-
-        # ---- sample ----
-        probs_flat = probs.view(-1, 7)                 # (1152, 7)
-        next_frame_indices = torch.multinomial(probs_flat, num_samples=1).view(1, 1152)
-        next_frame = next_frame_indices.float().unsqueeze(1)
-        generated = torch.cat([generated, next_frame], dim=1)
-        
-
-output_dir = "generated_frames"
-os.makedirs(output_dir, exist_ok=True)
-
-mapping = {
-    0: ' ',
-    1: '/',
-    2: '|',
-    3: '\\',
-    4: '_',
-    5: '~',
-    6: '&',
-}
-
-num_frames = generated.shape[1]
-
-for i in range(num_frames):
-    frame_vec = generated[0, i, :].cpu().numpy()            # (1152,)                             # denormalize
-    frame_vec = frame_vec.astype(int)
-    
-    grid = frame_vec.reshape(24, 48)  # (24, 48)
-    
-    def map_value(x):
-        return mapping.get(x, str(x))
-    
-    """lines = []
-    for row in range(24):
-        line = ' '.join(map(str, grid[row]))
-        lines.append(line)
-
-    content = '\n'.join(lines)"""
-
-    lines = []
-    for row in range(24):
-        line_chars = [map_value(grid[row, col]) for col in range(48)]
-        lines.append(''.join(line_chars))
-
-    content = '\n'.join(lines)
-    
-    filename = os.path.join(output_dir, f"frame_{i:04d}.txt")
-    with open(filename, 'w') as f:
-        f.write(content)
-    
-    if (i + 1) % 50 == 0:
-        print(f"Saved {i+1}/{num_frames} frame")
-
-print(f"✅ Saved all {num_frames} frames in directory: {output_dir}")
-
-enc = ConvEncoder(n_emb=64)
-dec = ConvDecoder(n_emb=64)
-x = torch.randn(2, 1, 24, 48)
-z = enc(x)          # (2, 64)
-out = dec(z)        # (2, 7, 24, 48)
-print(z.shape, out.shape)

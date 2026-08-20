@@ -210,7 +210,7 @@ class GPT(nn.Module):
             WOOD_CLASSES = [1, 2, 3, 4, 5]
             probs = F.softmax(logits, dim=-1)
             entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
-            entropy_penalty = -0.03 * entropy
+            entropy_penalty = -0.02 * entropy
 
             wood_prob = probs[..., WOOD_CLASSES].sum(dim=-1)
             wood_prob = wood_prob.view(B, T, 24, 48)
@@ -219,42 +219,21 @@ class GPT(nn.Module):
             grad_w = torch.abs(wood_prob[:, :, :, 1:] - wood_prob[:, :, :, :-1])
             mean_grad = (grad_h.mean() + grad_w.mean()) / 2.0
             shape_loss = torch.exp(-mean_grad * 8.0)
-            #shape_loss = mean_grad
 
-            # ---------
-
-            up    = F.pad(wood_prob[:, :, :-1, :], (0, 0, 1, 0))
-            down  = F.pad(wood_prob[:, :, 1:, :],  (0, 0, 0, 1))
-            left  = F.pad(wood_prob[:, :, :, :-1], (1, 0, 0, 0))
-            right = F.pad(wood_prob[:, :, :, 1:],  (0, 1, 0, 0))
-
-            neighbor_max = torch.maximum(
-                torch.maximum(up, down),
-                torch.maximum(left, right)
-            )
-
-
-            isolated_loss = (
-                wood_prob * F.relu(0.3 - neighbor_max)
-            ).mean()
-
-
-
-            # ---------
 
             wood_2d = wood_prob.reshape(B * T, 1, 24, 48)
 
-            wood_count_5x5 = F.avg_pool2d(
+            wood_count_6x6 = F.avg_pool2d(
                 wood_2d,
-                kernel_size=5,
+                kernel_size=6,
                 stride=1,
                 padding=2
-            ) * 25.0
+            ) * 36.0
 
-            large_wood_loss = F.relu(wood_count_5x5 - 20.0).mean()
+            large_wood_loss = F.relu(wood_count_6x6 - 27.0).mean()
 
 
-            loss = main_loss + 0.3 * shape_loss + 0.1 * progress_loss + 0.2 * entropy_penalty + 5.0 * isolated_loss + 0.1 * large_wood_loss
+            loss = main_loss + 0.0 * shape_loss + 0.1 * progress_loss + entropy_penalty + 0.1 * large_wood_loss
 
             return logits, loss
         return logits, None

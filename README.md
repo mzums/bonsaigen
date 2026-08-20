@@ -34,3 +34,12 @@ _gradient noise made the results worse_
 ![alt text](images/image-14.png)
 ![alt text](images/image-15.png)
 ![alt text](images/image-16.png)
+
+`loss = main_loss + 0.0 * shape_loss + 0.1 * progress_loss + entropy_penalty + 0.1 * large_wood_loss`
+large_wood_loss with 6x6 kernel
+![alt text](images/image-17.png)
+![alt text](images/image-18.png)
+![alt text](images/image-19.png)
+![alt text](images/image-20.png)
+![alt text](images/image-21.png)
+![alt text](images/image-22.png)
