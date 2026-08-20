@@ -1,45 +1,101 @@
-Encoder (with GlobalAveragePooling and Linear) and Decoder (billinear with BatchNorm) after 100k steps
-_transformer operates on whole frames_
+# bonsaigen
 
-![alt text](images/image-3.png)
+A model that generates bonsai trees trained on cbonsai
 
-Encoder (without GlobaAveragePooling and Linear) and Decoder (billinear and without BatchNorm) H=3, W=6 after 100k steps
-_transformer operates sequentially on patches_
+![alt text](gallery/image.png)
 
-![alt text](images/image.png)
-![alt text](images/image-1.png)
-![alt text](images/image-2.png)
+# [**Try it here**](https://mzums.com/bonsai/)
 
-With GAP after 150k steps  
-![alt text](images/image-4.png)
-![alt text](images/image-5.png)
-![alt text](images/image-6.png)
+The API is written in Python using Flask.  
+The model outputs 24x48 ascii trees which are colored randomly, the original base is added and the result is converted into html.
 
-Encoder with linear but without GAP, Decoder with PixelShuffle, without BN after 150k steps  
-![alt text](images/image-7.png)
-![alt text](images/image-8.png)
-![alt text](images/image-9.png)
+## Model
 
-No shape_loss, bigger encoder (128 channels), dropout added, bigger emb, ater 2k steps  
-![alt text](images/image-10.png)
-![alt text](images/image-11.png)
+This is a GPT2-like model with a convolutional decoder and encoder
 
-Encoder with FC layers, dropout in enc, entropy penalty  
-![alt text](images/image-12.png)
-![alt text](images/image-13.png)  
-_generates only these two two types of images_  
-_gradient noise made the results worse_
+- Encoder:
+  - ~10.3M parameters
+  - 3 convolutional layers
+  - 2 MaxPool layers
+  - Batch Normalization
+  - 2 fully connected (FC) layers
+  - ReLU activations
+  - Dropout
 
-`loss = main_loss + 0.3 * shape_loss + 0.1 * progress_loss + 0.2 * entropy_penalty + 5.0 * isolated_loss + 0.1 * large_wood_loss`  
-![alt text](images/image-14.png)
-![alt text](images/image-15.png)
-![alt text](images/image-16.png)
+- GPT:
+  - ~85M parameters
+  - embedding size of 768
+  - vocab_size of 7
+  - 12 Transformer layers
+  - 12 attention heads
+  - context length of 256 previous frames
+  - dropout of 0.2
 
-`loss = main_loss + 0.0 * shape_loss + 0.1 * progress_loss + entropy_penalty + 0.1 * large_wood_loss`
-large_wood_loss with 6x6 kernel
-![alt text](images/image-17.png)
-![alt text](images/image-18.png)
-![alt text](images/image-19.png)
-![alt text](images/image-20.png)
-![alt text](images/image-21.png)
-![alt text](images/image-22.png)
+- Decoder:
+  - ~7.5M parameters
+  - 2 transposed convolutional (deconvolutional) layers
+  - 2 convolutional layers
+  - 1 FC layer
+  - ReLU activations
+
+Total: ~102.8M parameters.
+
+## Dataset
+
+The model was trained on trees generated using from [cbonsai](https://gitlab.com/jallbrit/cbonsai).  
+First trees are generated in a small terminal window, then the base is cropped. Final trees used for training are 24x48 pixels.  
+For details see [get_data/main.py](get_data/main.py).
+
+## Tokenization
+
+Each tree is a combination of 7 characters (including ` ` and `\n`) and is tokenized to numbers 0-6
+
+## Future updates
+
+- Growth animation
+- Diffusion model
+- GAN model
+- VAE model
+
+## Development process
+
+To see how my changes influenced the results head to [roadmap.md](roadmap.md)
+
+## Local development
+
+1. Clone the repo  
+   `git clone https://github.com/mzums/bonsaigen`
+2. Enter the directory  
+   `cd bonsaigen`
+3. Create conda evironment  
+   `conda create --name bonsaigen python=3.12`
+4. Activate the environment  
+   `conda activate bonsaigen`
+5. Install dependencies  
+   `pip install -r requirements.txt`
+6. Get data  
+   `cd get_data`  
+   `python main.py`
+7. Run cells in `ml/explore.ipynb`
+8. Run training  
+   `cd ml/gpt_conv/enc`  
+   `python train.py`
+9. Generate trees  
+   `python generate.py`
+10. Run API  
+    `cd api`  
+    `python app.py`
+
+## Credits
+
+This model is based on the implementation in Andrej Karpathy's [_Zero to Hero_](https://karpathy.ai/zero-to-hero.html) series, although it contains a custom dataloader, a convolutional encoder and decoder and a lot of my comments, explanations, experiments and the API.
+
+It also wouldn't exist without the original [cbonsai](https://gitlab.com/jallbrit/cbonsai) - my favourite command line program.
+
+## Gallery
+
+<img src="gallery/image-1.png" height="400">
+<img src="gallery/image-2.png" height="400">
+<img src="gallery/image-3.png" height="400">
+<img src="gallery/image-4.png" height="400">
+<img src="gallery/image-5.png" height="400">
