@@ -50,6 +50,10 @@ For details see [get_data/main.py](get_data/main.py).
 
 Each tree is a combination of 7 characters (including ` ` and `\n`) and is tokenized to numbers 0-6
 
+## Training
+
+Trained on 1k growing tree animations (200 frames, 24x48 pixels each) for 2k steps
+
 ## Future updates
 
 - Growth animation
