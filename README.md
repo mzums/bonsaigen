@@ -92,7 +92,7 @@ To see how my changes influenced the results head to [roadmap.md](roadmap.md)
 
 ## Credits
 
-This model is based on the implementation in Andrej Karpathy's [_Zero to Hero_](https://karpathy.ai/zero-to-hero.html) series, although it contains a custom dataloader, a convolutional encoder and decoder and a lot of my comments, explanations, experiments and the API.
+This model is based on the implementation in Andrej Karpathy's [_Zero to Hero_](https://karpathy.ai/zero-to-hero.html) series (that I also used for another project, [FakeWiki](https://github.com/mzums/fakewiki)), although it contains a custom dataloader, a convolutional encoder and decoder and a lot of my comments, explanations, experiments and the API.
 
 It also wouldn't exist without the original [cbonsai](https://gitlab.com/jallbrit/cbonsai) - my favourite command line program.
 
